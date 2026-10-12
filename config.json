@@ -1,0 +1,40 @@
+{
+  "ping_interval_min": 20,
+  "ping_timeout_sec": 180,
+  "quality_every_hours": 6,
+  "task_timeout_sec": 900,
+  "tasks": ["cron_next", "sheet_engine", "patch_apply"],
+  "keep_raw": true,
+  "env_file": ".env",
+  "codex_ignore_user_config": true,
+  "codex_config_overrides": [],
+  "targets": [
+    {
+      "name": "claude-opus",
+      "cli": "claude",
+      "bin": "/opt/homebrew/bin/claude",
+      "model": "claude-opus-5-5",
+      "effort": "high",
+      "ping_effort": "low",
+      "enabled": true
+    },
+    {
+      "name": "codex-astra",
+      "cli": "codex",
+      "bin": "/opt/homebrew/bin/codex",
+      "model": "gpt-6-astra",
+      "effort": "high",
+      "ping_effort": "low",
+      "enabled": true
+    },
+    {
+      "name": "claude-fable",
+      "cli": "claude",
+      "bin": "/opt/homebrew/bin/claude",
+      "model": "claude-fable-5-1",
+      "effort": "high",
+      "ping_effort": "low",
+      "enabled": false
+    }
+  ]
+}

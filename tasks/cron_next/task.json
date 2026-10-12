@@ -1,0 +1,6 @@
+{
+  "id": "cron_next",
+  "title": "Implement a cron next-fire calculator with L/W/# extensions from a written spec",
+  "difficulty": "hard",
+  "prompt": "Implement next_fire in cronnext.py so that it follows every rule in SPEC.md exactly. test_visible.py has a few example checks (run it with: python3 test_visible.py), but it covers only a small part of the spec. Use only the Python standard library."
+}

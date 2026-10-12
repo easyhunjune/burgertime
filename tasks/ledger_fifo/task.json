@@ -1,0 +1,5 @@
+{
+  "id": "ledger_fifo",
+  "title": "Find and fix every bug in a FIFO P&L ledger",
+  "prompt": "A user reports that the realized P&L from ledger.py does not match their broker statement. Fix ledger.py so that it behaves exactly as README.md describes. test_ledger.py reproduces the reported case (run it with: python3 test_ledger.py), but there may be more problems than the one it covers. Keep the public API unchanged and use only the Python standard library."
+}

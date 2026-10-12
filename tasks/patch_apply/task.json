@@ -1,0 +1,6 @@
+{
+  "id": "patch_apply",
+  "title": "Find and fix every bug in a unified-diff applier",
+  "difficulty": "hard",
+  "prompt": "Our release tooling applies patches with patch.py, and a release just failed with a patch that GNU patch applies fine. Fix patch.py so that it behaves exactly as README.md describes. test_patch.py reproduces the failing case (run it with: python3 test_patch.py), but the module has not been reviewed carefully and there may be many more problems than that one. Keep the public API unchanged and use only the Python standard library."
+}

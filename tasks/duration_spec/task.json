@@ -1,0 +1,5 @@
+{
+  "id": "duration_spec",
+  "title": "Implement a duration parser/formatter from a written spec",
+  "prompt": "Implement parse_duration and format_duration in duration.py so that they follow every rule in SPEC.md exactly. test_visible.py has a few example checks (run it with: python3 test_visible.py), but it covers only a small part of the spec. Use only the Python standard library."
+}

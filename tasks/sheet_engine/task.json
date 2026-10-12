@@ -1,0 +1,6 @@
+{
+  "id": "sheet_engine",
+  "title": "Implement a spreadsheet formula engine with cycles, error propagation and deep chains",
+  "difficulty": "hard",
+  "prompt": "Implement the Sheet class in sheet.py so that it follows every rule in SPEC.md exactly. test_visible.py has a few example checks (run it with: python3 test_visible.py), but it covers only a small part of the spec. Use only the Python standard library."
+}
