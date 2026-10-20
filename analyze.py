@@ -27,6 +27,12 @@ from pathlib import Path
 BENCH_DIR = Path(__file__).resolve().parent
 # 서버 쪽 문제로 볼 수 있는 실패. rate_limited는 내 사용량에 따라 생기므로 버거타임 판단에서 뺀다.
 SERVER_ERRORS = ("overloaded", "timeout", "cli_error")
+# 측정 조건이 깨진 구간 (cli, kind, 시작 KST, 끝 KST(미포함), 이유). README 변경 기록과 같이 관리한다.
+# 이 구간 기록에는 extra_models 필드가 없어서 시각으로 뺀다.
+BROKEN_WINDOWS = [
+    ("claude", "quality", "2026-10-18 21:25", "2026-10-21 01:23",
+     "Claude advisor(다른 모델 조언)가 섞인 과제 실행"),
+]
 CODEX_THINKING_NOTE = ("Codex의 thinking 토큰(reasoning_output_tokens)은 실제 추론량보다 훨씬 작게 찍힙니다"
                        " (예: high effort 95초 과제에 146). 참고용으로만 보세요.")
 
@@ -100,6 +106,16 @@ def filter_records(recs, args):
         if not args.include_overlap and r.get("kind") == "ping" and r.get("quality_running"):
             dropped["과제 실행과 겹친 ping"] += 1
             continue
+        if not args.include_extra_models:
+            if r.get("extra_models"):
+                dropped["요청 모델 외 다른 모델이 함께 쓰인 실행"] += 1
+                continue
+            broken = next((why for cli, kind, start, end, why in BROKEN_WINDOWS
+                           if r.get("cli") == cli and r.get("kind") == kind
+                           and start <= kst_stamp(r) < end), None)
+            if broken:
+                dropped[broken] += 1
+                continue
         u = util_of(r)
         if u is not None and u >= args.max_util:
             dropped[f"사용량 {args.max_util:.0%} 이상"] += 1
@@ -367,7 +383,7 @@ def target_report(name, recs, args, burger, rng):
 CSV_COLUMNS = [
     "started_utc", "kst_date", "kst_hour", "us_pacific_weekday", "kind", "trigger", "run_id", "target",
     "cli", "task", "task_version", "status", "score", "passed", "total", "requested_model",
-    "served_model", "model_mismatch", "requested_effort", "served_effort", "cli_version",
+    "served_model", "model_mismatch", "extra_models", "advisor_calls", "requested_effort", "served_effort", "cli_version",
     "t_first_output_sec", "ttft_ms", "duration_api_ms", "wall_sec", "num_turns", "tool_calls",
     "output_tokens", "thinking_tokens", "input_tokens", "cached_input_tokens", "rl_5h_util",
     "rl_7d_util", "inference_geo", "service_tier", "after_gap", "quality_running",
@@ -386,6 +402,8 @@ def main():
                     help="사용량 한도 사용률이 이 값 이상인 기록 제외 (기본 0.95)")
     ap.add_argument("--include-after-gap", action="store_true", help="잠자기 직후 실행도 포함")
     ap.add_argument("--include-overlap", action="store_true", help="과제 실행과 겹친 ping도 포함")
+    ap.add_argument("--include-extra-models", action="store_true",
+                    help="다른 모델(advisor 등)이 함께 쓰인 실행과 BROKEN_WINDOWS 구간도 포함")
     ap.add_argument("--all-triggers", action="store_true", help="수동·calibrate 실행도 포함")
     ap.add_argument("--min-n", type=int, default=10,
                     help="비교에 필요한 최소 묶음 수 (ping=날짜 수, quality=실행 수)")

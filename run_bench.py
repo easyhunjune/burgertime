@@ -377,9 +377,15 @@ def classify(timed_out, ok, text, http_status=None, rl_rejected=False):
 
 # ---------------------------------------------------------------- Claude Code
 
+# --safe-mode도 사용자 settings.json의 advisorModel은 그대로 적용한다. 그러면 측정 대상 모델이
+# 과제 중에 다른 모델(advisor)에게 조언을 받아 시간·토큰이 섞이므로, 빈 문자열로 덮어써 끈다.
+CLAUDE_SETTINGS = json.dumps({"advisorModel": ""})
+
+
 def claude_cmd(target, kind):
     exe = target.get("bin") or shutil.which("claude") or "claude"
-    cmd = [exe, "-p", "--safe-mode", "--no-session-persistence", "--permission-prompts", "none",
+    cmd = [exe, "-p", "--safe-mode", "--settings", CLAUDE_SETTINGS,
+           "--no-session-persistence", "--permission-prompts", "none",
            "--output-format", "stream-json", "--verbose", "--model", target["model"]]
     effort = target.get("ping_effort") if kind == "ping" else target.get("effort")
     if effort:
@@ -396,7 +402,7 @@ def parse_claude(res):
     init_model = version = result = rl = None
     served = Counter()
     first_t = None
-    tool_calls = thinking_chars = 0
+    tool_calls = thinking_chars = advisor_calls = 0
     for t, line in res["lines"]:
         j = _json(line)
         if j is None:
@@ -412,6 +418,8 @@ def parse_claude(res):
             for block in msg.get("content") or []:
                 if block.get("type") == "tool_use":
                     tool_calls += 1
+                elif block.get("type") == "server_tool_use" and block.get("name") == "advisor":
+                    advisor_calls += 1
                 elif block.get("type") == "thinking":
                     thinking_chars += len(block.get("thinking") or "")
         elif typ == "rate_limit_event":
@@ -424,6 +432,9 @@ def parse_claude(res):
     model_usage = result.get("modelUsage") or {}
     real_models = {m: n for m, n in served.items() if m not in ("<synthetic>", "?")}
     served_model = max(real_models, key=real_models.get) if real_models else None
+    # 응답 메시지에는 안 보이지만 사용량에는 잡히는 모델 (advisor, 하위 에이전트 등)
+    main_model = init_model or served_model
+    extra_models = sorted(m for m in model_usage if main_model and m != main_model)
     windows = (rl or {}).get("unifiedWindows") or {}
     out_tokens = sum(int(v.get("outputTokens") or 0) for v in model_usage.values())
     thinking = sum(int(v.get("thinkingTokens") or 0) for v in model_usage.values())
@@ -444,6 +455,8 @@ def parse_claude(res):
         "served_models": dict(served),
         "served_model": served_model,
         "model_mismatch": bool(init_model and any(m != init_model for m in real_models)),
+        "extra_models": extra_models,
+        "advisor_calls": advisor_calls,
         "served_effort": None,
         "t_first_output_sec": first_t,
         "ttft_ms": result.get("ttft_ms"),
@@ -712,7 +725,8 @@ def measure_ping(cfg, target, ctx, run_id):
         rec["raw_path"] = save_raw(run_id, f"{target['name']}__ping", res)
     append_record(rec)
     log(f"ping {target['name']}: {rec['status']} first={rec['t_first_output_sec']}s "
-        f"wall={rec['wall_sec']}s model={rec.get('served_model')}")
+        f"wall={rec['wall_sec']}s model={rec.get('served_model')}"
+        + (f"  (다른 모델 사용: {rec['extra_models']})" if rec.get("extra_models") else ""))
     return rec
 
 
@@ -762,7 +776,8 @@ def measure_task(cfg, target, task, ctx, run_id):
     log(f"quality {target['name']} {task['id']}: {rec['status']} score={rec['score']} "
         f"({rec['passed']}/{rec['total']}) wall={rec['wall_sec']}s "
         f"thinking={rec.get('thinking_tokens')} model={rec.get('served_model')}"
-        + ("" if rec["workspace_changed"] else "  (파일 변경 없음!)"))
+        + ("" if rec["workspace_changed"] else "  (파일 변경 없음!)")
+        + (f"  (다른 모델 사용: {rec['extra_models']})" if rec.get("extra_models") else ""))
     return rec
 
 
@@ -1007,7 +1022,8 @@ def cmd_status(cfg, args):
         score = "" if r.get("score") is None else f" score={r['score']:.2f}"
         print(f"{when} KST {r.get('kind'):<7} {r.get('target'):<14} {r.get('task') or '':<14} "
               f"{r.get('status'):<12} wall={r.get('wall_sec')}s{score} model={r.get('served_model')}"
-              + (" MISMATCH" if r.get("model_mismatch") else ""))
+              + (" MISMATCH" if r.get("model_mismatch") else "")
+              + (f" EXTRA={r['extra_models']}" if r.get("extra_models") else ""))
     state = load_state()
     if state.get("last_tick_ts"):
         last = dt.datetime.fromtimestamp(state["last_tick_ts"], KST).strftime("%m-%d %H:%M")
