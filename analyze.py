@@ -9,6 +9,7 @@
   python3 analyze.py --since ... --until ... --verdict round1   # 사전 등록 규칙으로 판정표까지 출력
   python3 analyze.py --score-timeouts      # 과제 제한시간에 걸린 실행도 그 시점 산출물 점수로 포함 (2차용)
   python3 analyze.py --regrade results/regrade.jsonl   # 나중에 다시 채점한 점수(중앙값)로 바꿔서 분석
+  python3 analyze.py ... --drop-active-pings   # 민감도 분석: 그 사이 계정이 쓰인 ping(5시간 사용량 3%p 이상 증가)을 빼고 다시 분석
 
 신뢰구간은 클러스터 부트스트랩으로 구한다. 한 번의 과제 실행(run_id)에서 나온 기록들, 같은 날의 ping들은
 서로 묶여 움직이므로 기록 하나하나를 독립 표본으로 치면 구간이 실제보다 좁아진다.
@@ -171,8 +172,57 @@ def filter_records(recs, args):
         if u is not None and u >= args.max_util:
             dropped[f"사용량 {args.max_util:.0%} 이상"] += 1
             continue
+        if getattr(args, "drop_active_pings", False) and r.get("kind") == "ping" and r.get("_account_active"):
+            dropped[f"직전 기록보다 계정 사용량이 {getattr(args, 'active_delta', 0.03) * 100:g}%p 이상 오른 ping"] += 1
+            continue
         out.append(r)
     return out, dropped
+
+
+def mark_active_pings(recs, delta=0.03, max_gap_min=60):
+    """--drop-active-pings용. 직전 기록 이후 계정의 5시간 사용량이 delta 이상 오른 ping에 _account_active=True.
+    측정기 ping 하나는 5시간 사용량을 거의 움직이지 않으므로, 그만큼 오른 건 그 사이 누군가 계정을 쓴 것이다.
+    - 사용량은 계정 단위라 같은 CLI의 기록끼리 시작 시각 순으로 본다. 수동·calibrate 기록도 사용량 값으로는 쓴다.
+    - 기준점은 과제와 겹치지 않은 ping의 값이다. 과제 도중에 찍힌 값은 과제 사용량이 덜 반영돼 있다.
+    - 기준점 이후 같은 CLI의 측정기 과제가 있었거나 기준점이 max_gap_min분보다 오래됐으면 판단하지 않는다(None, 빼지 않음).
+      과제 자체가 쓰는 양과 사용자 사용을 나눌 수 없기 때문이다.
+    - 5시간 창이 리셋되거나 오래된 사용이 빠지면 값이 내려가므로, 그와 겹친 사용은 못 잡는다."""
+    by_cli = defaultdict(list)
+    for r in recs:
+        if r.get("cli") and r.get("started_utc"):
+            by_cli[r["cli"]].append(r)
+    for rows in by_cli.values():
+        rows.sort(key=lambda r: r["started_utc"])
+        anchor, task_since = None, False
+        for r in rows:
+            t = dt.datetime.fromisoformat(r["started_utc"])
+            if r.get("kind") == "quality":
+                task_since = True
+                continue
+            if r.get("kind") != "ping":
+                continue
+            u = r.get("rl_5h_util")
+            has_u = isinstance(u, (int, float)) and not isinstance(u, bool)
+            if anchor is None or task_since or not has_u or (t - anchor[0]).total_seconds() > max_gap_min * 60:
+                r["_account_active"] = None
+            else:
+                r["_account_active"] = round(u - anchor[1], 4) >= delta
+            if has_u and not r.get("quality_running"):
+                anchor, task_since = (t, u), False
+
+
+def active_report(recs, burger):
+    """--drop-active-pings로 뺀 ping이 어느 시간대에 몰렸는지 (빠지는 시간대가 치우치면 비교 구성이 바뀐다)."""
+    for cli in sorted({r.get("cli") for r in recs if r.get("kind") == "ping"}):
+        rs = [r for r in recs if r.get("kind") == "ping" and r.get("cli") == cli]
+        cnt = Counter("뺌" if r.get("_account_active") else ("판단 안 함" if r.get("_account_active") is None else "유지")
+                      for r in rs)
+        share = []
+        for name, sel in (("버거타임", lambda r: hour_of(r) in burger), ("나머지", lambda r: hour_of(r) not in burger)):
+            s = [r for r in rs if sel(r)]
+            share.append(f"{name} {sum(1 for r in s if r.get('_account_active')) / max(1, len(s)):.1%}")
+        print(f"  {cli} ping: 뺌 {cnt['뺌']}건 / 유지 {cnt['유지']}건 / 판단 안 함(직전 기준점이 오래됐거나 사이에 과제) "
+              f"{cnt['판단 안 함']}건 / 뺀 비율 {', '.join(share)}")
 
 
 # ---------------------------------------------------------------- stats
@@ -703,6 +753,10 @@ def main():
     ap.add_argument("--score-timeouts", action="store_true",
                     help="과제 제한시간에 걸린 실행도 그 시점 점수·시간·thinking 추정치로 포함 (기본: 성공만)")
     ap.add_argument("--regrade", help="run_bench.py regrade 결과 파일. 과제 점수를 다시 채점한 중앙값으로 바꿈")
+    ap.add_argument("--drop-active-pings", action="store_true",
+                    help="민감도 분석: 직전 기록보다 계정 5시간 사용량이 --active-delta 이상 오른 ping을 뺌 (2차 기준)")
+    ap.add_argument("--active-delta", type=float, default=0.03,
+                    help="--drop-active-pings의 기준 (5시간 사용량 증가분, 기본 0.03 = 3%%p)")
     args = ap.parse_args()
     global SCORE_TIMEOUTS
     SCORE_TIMEOUTS = args.score_timeouts
@@ -712,9 +766,17 @@ def main():
         print(f"{path} 가 없습니다. 먼저 run_bench.py 로 기록을 쌓으세요.")
         return 1
     burger = parse_hours(args.burger)
-    recs, dropped = filter_records(load(path), args)
+    loaded = load(path)
+    if args.drop_active_pings:
+        mark_active_pings(loaded, args.active_delta)
+    recs, dropped = filter_records(loaded, args)
     print(f"기록 {len(recs)}건 사용" + (f" / 제외: {dict(dropped)}" if dropped else ""))
     print(f"버거타임 = 한국시간 {sorted(burger)}시")
+    if args.drop_active_pings:
+        print(f"민감도 분석: 직전 기록보다 계정 5시간 사용량이 {args.active_delta * 100:g}%p 이상 오른 ping을 뺌"
+              " (--drop-active-pings, 다른 제외 규칙을 통과한 ping 기준)")
+        active_report(filter_records(loaded, argparse.Namespace(**{**vars(args), "drop_active_pings": False}))[0],
+                      burger)
     if args.score_timeouts:
         print("과제: 제한시간에 걸린 실행도 그 시점 산출물 점수로 포함 (--score-timeouts)")
     if args.regrade:
