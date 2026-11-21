@@ -6,6 +6,7 @@
   ping       모든 대상에 아주 짧은 프롬프트를 보내 응답 속도를 잰다
   quality    코딩 과제를 풀게 하고 숨은 테스트로 채점한다
   calibrate  quality를 여러 번 돌려 과제 난이도(천장 여부)를 확인한다
+  regrade    보관한 작업 폴더를 지금의 숨은 테스트로 다시 채점한다 (모델 호출 없음)
   tick       launchd가 주기적으로 부르는 진입점 (ping + 정해진 시각이면 quality)
   status     최근 기록 몇 줄을 보여준다
 
@@ -79,6 +80,7 @@ def time_fields(ts):
     kst, pac = utc.astimezone(KST), utc.astimezone(PACIFIC)
     return {
         "started_utc": utc.isoformat(timespec="seconds"),
+        "started_ts": round(ts, 3),  # 단계별 시간(t_boot_sec 등)을 초 단위 반올림 없이 계산하려고
         "kst_date": kst.date().isoformat(),
         "kst_hour": kst.hour,
         "kst_weekday": kst.weekday(),
@@ -193,7 +195,16 @@ def load_config():
         if t["cli"] not in ("claude", "codex"):
             sys.exit(f"config.json: {t['name']}의 cli는 claude 또는 codex여야 합니다.")
     load_env_file(cfg)
+    if cfg.get("disable_cli_autoupdate", True):
+        CLAUDE_EXTRA_ENV["DISABLE_AUTOUPDATER"] = "1"
     return cfg
+
+
+def mark_version(cfg, rec):
+    """config의 expected_cli_versions에 적어 둔 버전과 다르면 version_drift를 남긴다(비어 있으면 아무것도 안 함)."""
+    want = (cfg.get("expected_cli_versions") or {}).get(rec.get("cli"))
+    if want:
+        rec["version_drift"] = rec.get("cli_version") != want
 
 
 # launchd 작업은 로그인 키체인의 Claude 로그인을 못 읽거나 만료된 것을 읽을 수 있다.
@@ -201,12 +212,17 @@ def load_config():
 # (측정기 전체 환경에 넣으면 codex 실행과 채점기까지 토큰을 물려받는다.) 이 목록에 있는 키만 읽는다.
 ENV_KEYS = ("CLAUDE_CODE_OAUTH_TOKEN",)
 CLAUDE_ENV = {}
+# 측정 중에 CLI가 스스로 업데이트하지 않게 한다 (config의 disable_cli_autoupdate, 기본 켬).
+# 측정기 밖에서 사용자가 실행한 claude가 같은 실행 파일을 업데이트하는 것까지는 막지 못하므로,
+# 버전은 계속 기록하고 expected_cli_versions와 다르면 version_drift로 표시한다.
+CLAUDE_EXTRA_ENV = {}
 
 
 def claude_env():
     """claude를 실행할 때 쓸 환경. 현재 환경에 env_file에서 읽은 키만 더한다."""
     env = dict(os.environ)
     env.update(CLAUDE_ENV)
+    env.update(CLAUDE_EXTRA_ENV)
     return env
 
 
@@ -275,17 +291,23 @@ def _hash_paths(paths):
     return h.hexdigest()[:10]
 
 
+def load_task(tid):
+    d = TASKS_DIR / tid
+    meta = json.loads((d / "task.json").read_text(encoding="utf-8"))
+    meta["dir"] = d
+    # hidden/(숨은 테스트 데이터)는 2차 과제부터 있다. 없는 과제는 1차와 같은 해시가 나온다.
+    hidden = [d / "hidden"] if (d / "hidden").is_dir() else []
+    meta["version"] = _hash_paths([d / "workspace", d / "grade.py", d / "task.json",
+                                   TASKS_DIR / "_grading.py"] + hidden)
+    return meta
+
+
 def load_tasks(cfg, only=None):
     tasks = []
     for tid in cfg["tasks"]:
         if only and tid not in only:
             continue
-        d = TASKS_DIR / tid
-        meta = json.loads((d / "task.json").read_text(encoding="utf-8"))
-        meta["dir"] = d
-        meta["version"] = _hash_paths([d / "workspace", d / "grade.py", d / "task.json",
-                                       TASKS_DIR / "_grading.py"])
-        tasks.append(meta)
+        tasks.append(load_task(tid))
     if only:
         missing = set(only) - {t["id"] for t in tasks}
         if missing:
@@ -401,8 +423,9 @@ def claude_cmd(target, kind):
 def parse_claude(res):
     init_model = version = result = rl = None
     served = Counter()
-    first_t = None
+    first_t = init_t = None
     tool_calls = thinking_chars = advisor_calls = 0
+    thinking_est = 0
     for t, line in res["lines"]:
         j = _json(line)
         if j is None:
@@ -410,6 +433,13 @@ def parse_claude(res):
         typ = j.get("type")
         if typ == "system" and j.get("subtype") == "init":
             init_model, version = j.get("model"), j.get("claude_code_version")
+            if init_t is None:
+                init_t = t
+        elif typ == "system" and j.get("subtype") == "thinking_tokens":
+            # 실행 중에 흘러나오는 thinking 토큰 추정치. 제한시간에 걸려 최종 사용량 보고가 없어도 남는다.
+            delta = j.get("estimated_tokens_delta")
+            if isinstance(delta, (int, float)) and not j.get("parent_tool_use_id"):
+                thinking_est += delta
         elif typ == "assistant" and not j.get("parent_tool_use_id"):
             msg = j.get("message") or {}
             served[msg.get("model") or "?"] += 1
@@ -459,12 +489,16 @@ def parse_claude(res):
         "advisor_calls": advisor_calls,
         "served_effort": None,
         "t_first_output_sec": first_t,
+        # 단계: 프로세스 시작 ~ CLI 초기화 이벤트(로컬), 첫 API 요청의 첫 토큰까지(CLI가 잰 TTFT)
+        "t_boot_sec": init_t,
+        "t_model_sec": None if result.get("ttft_ms") is None else round(result["ttft_ms"] / 1000.0, 3),
         "ttft_ms": result.get("ttft_ms"),
         "duration_api_ms": result.get("duration_api_ms"),
         "num_turns": result.get("num_turns"),
         "tool_calls": tool_calls,
         "output_tokens": out_tokens or usage.get("output_tokens"),
         "thinking_tokens": thinking,
+        "thinking_tokens_est": thinking_est if thinking_est else None,
         "thinking_chars": thinking_chars,
         "input_tokens": usage.get("input_tokens"),
         "cached_input_tokens": usage.get("cache_read_input_tokens"),
@@ -517,10 +551,28 @@ def codex_version(exe):
     return _codex_version_cache[exe]
 
 
-def read_codex_rollout(thread_id):
-    """세션 로그(rollout)에서 클라이언트가 실제로 쓴 모델·effort와 사용량 한도를 읽는다."""
+def _iso_epoch(text):
+    """rollout의 ISO 시각 -> epoch 초. Python 3.9의 fromisoformat은 소수점 아래 3·6자리만 받으므로 6자리로 맞춘다."""
+    try:
+        text = text.replace("Z", "+00:00")
+        text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
+        return dt.datetime.fromisoformat(text).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def _item_text(payload):
+    return "\n".join(c.get("text") or "" for c in payload.get("content") or [] if isinstance(c, dict))
+
+
+def read_codex_rollout(thread_id, prompt=None):
+    """세션 로그(rollout)에서 클라이언트가 실제로 쓴 모델·effort와 사용량 한도를 읽는다.
+    단계별 시각도 읽는다: 세션 생성(session_meta) -> 프롬프트 기록(우리가 보낸 사용자 메시지) -> 첫 모델 출력.
+    요청 구성(기본 지시 + developer 메시지 + 그 밖의 앞쪽 사용자 메시지)의 해시도 남긴다.
+    스킬·원격 플러그인 목록이 바뀌면 해시가 바뀐다."""
     if not thread_id:
         return {}
+    prompt_head = (prompt or "").strip()[:60]
     sessions = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions"
     found = []
     today = dt.date.today()
@@ -532,14 +584,37 @@ def read_codex_rollout(thread_id):
     if not found:
         return {"rollout_found": False}
     models, efforts, cli_version, rates = Counter(), Counter(), None, None
+    t_meta = t_user = t_answer = None
+    prompt_parts = []
     with open(found[0], encoding="utf-8", errors="replace") as fh:
         for line in fh:
             j = _json(line)
             if j is None:
                 continue
             payload = j.get("payload") or {}
+            if j.get("type") == "response_item":
+                role, ptype = payload.get("role"), payload.get("type")
+                if t_user is None:
+                    text = _item_text(payload)
+                    if role == "developer":
+                        prompt_parts.append(text)
+                    elif role == "user":
+                        head = text.lstrip()
+                        is_prompt = (prompt_head in text) if prompt_head else not head.startswith("<")
+                        if is_prompt:
+                            t_user = _iso_epoch(j.get("timestamp"))
+                        elif not head.startswith("<environment_context>"):  # 임시 폴더 경로가 들어 있어 뺀다
+                            prompt_parts.append(text)
+                elif t_answer is None and role not in ("user", "developer", "system") \
+                        and ptype != "function_call_output":
+                    t_answer = _iso_epoch(j.get("timestamp"))
             if j.get("type") == "session_meta":
                 cli_version = payload.get("cli_version")
+                if t_meta is None:
+                    t_meta = _iso_epoch(j.get("timestamp"))
+                    base = payload.get("base_instructions")
+                    base_text = (base.get("text") or "") if isinstance(base, dict) else str(base or "")
+                    prompt_parts.insert(0, base_text)
             elif j.get("type") == "turn_context":
                 models[payload.get("model")] += 1
                 efforts[payload.get("effort")] += 1
@@ -552,10 +627,19 @@ def read_codex_rollout(thread_id):
         pct = (rates.get(window) or {}).get("used_percent")
         return None if pct is None else round(pct / 100.0, 4)
 
+    joined = "\n".join(prompt_parts)
     return {
         "rollout_found": True,
         "rollout_models": dict(models),
         "rollout_efforts": dict(efforts),
+        "_t_meta": t_meta,
+        "_t_user": t_user,
+        "_t_answer": t_answer,
+        "prompt_hash": hashlib.sha1(joined.encode("utf-8")).hexdigest()[:10] if joined else None,
+        "prompt_chars": len(joined) if joined else None,
+        # 1차 때 Codex 핑의 절반쯤에 원격 curated 플러그인 스킬 목록이 끼어 들어가 약 1초 느렸다.
+        # (이름만으로는 안 되고, 플러그인 캐시 경로 줄이 있을 때가 실제로 목록이 들어간 경우다.)
+        "remote_plugins": ("plugins/cache/openai-curated-remote" in joined) if joined else None,
         "cli_version": cli_version,
         "rl_5h_util": used("primary"),
         "rl_7d_util": used("secondary"),
@@ -566,7 +650,7 @@ def read_codex_rollout(thread_id):
     }
 
 
-def parse_codex(res, target, exe):
+def parse_codex(res, target, exe, prompt=None):
     thread_id = first_t = None
     usage, items = Counter(), Counter()
     errors, final_text = [], ""
@@ -598,7 +682,7 @@ def parse_codex(res, target, exe):
         elif typ == "error":
             errors.append(str(j.get("message"))[:300])
 
-    roll = read_codex_rollout(thread_id)
+    roll = read_codex_rollout(thread_id, prompt)
     models = roll.get("rollout_models") or {}
     efforts = roll.get("rollout_efforts") or {}
     served_model = max(models, key=models.get) if models else None
@@ -619,6 +703,13 @@ def parse_codex(res, target, exe):
         "served_effort": served_effort,
         "rollout_found": roll.get("rollout_found"),
         "t_first_output_sec": first_t,
+        # epoch 시각. measure_*()가 시작 시각(started_ts)을 빼서 t_boot/t_prep/t_model_sec로 바꾸고 지운다.
+        "_t_meta": roll.get("_t_meta"),
+        "_t_user": roll.get("_t_user"),
+        "_t_answer": roll.get("_t_answer"),
+        "prompt_hash": roll.get("prompt_hash"),
+        "prompt_chars": roll.get("prompt_chars"),
+        "remote_plugins": roll.get("remote_plugins"),
         "ttft_ms": None,
         "duration_api_ms": None,
         "num_turns": items.get("agent_message"),
@@ -647,7 +738,22 @@ def build_and_run(cfg, target, kind, cwd, prompt, timeout):
         return res, parse_claude(res)
     cmd = codex_cmd(cfg, target, kind, cwd)
     res = run_process(cmd, cwd, prompt, timeout)
-    return res, parse_codex(res, target, cmd[0])
+    return res, parse_codex(res, target, cmd[0], prompt)
+
+
+def add_phases(rec, started):
+    """Codex rollout의 epoch 시각(_t_*)을 시작 시각 기준 단계별 시간으로 바꾼다.
+    t_boot_sec  프로세스 시작 ~ 세션 생성  (CLI 실행·인증 등)
+    t_prep_sec  세션 생성 ~ 프롬프트 기록  (지시문·스킬·플러그인 구성, 원격 동기화 포함)
+    t_model_sec 프롬프트 기록 ~ 첫 모델 출력 (요청 전송·서버 대기·추론·출력; 핑은 답 전체)
+    Claude는 parse_claude가 t_boot_sec(초기화 이벤트)와 t_model_sec(CLI가 잰 TTFT)를 바로 채운다."""
+    t_meta, t_user, t_answer = rec.pop("_t_meta", None), rec.pop("_t_user", None), rec.pop("_t_answer", None)
+    if t_meta is not None:
+        rec["t_boot_sec"] = round(t_meta - started, 3)
+        if t_user is not None:
+            rec["t_prep_sec"] = round(t_user - t_meta, 3)
+            if t_answer is not None:
+                rec["t_model_sec"] = round(t_answer - t_user, 3)
 
 
 def base_record(kind, run_id, target, started, ctx, task=None):
@@ -668,6 +774,12 @@ def base_record(kind, run_id, target, started, ctx, task=None):
         "bench_platform": sys.platform,
     }
     rec.update(time_fields(started))
+    if kind == "quality" and ctx.get("slot_epoch_hour") is not None:
+        # 예정된 측정 시각. 두 CLI를 차례로 돌리면 두 번째 대상은 실제 시작이 한 시간 넘게 밀릴 수 있다.
+        slot = dt.datetime.fromtimestamp(ctx["slot_epoch_hour"] * 3600, dt.timezone.utc).astimezone(KST)
+        rec["slot_epoch_hour"] = ctx["slot_epoch_hour"]
+        rec["slot_kst_hour"] = slot.hour
+        rec["cli_order"] = ctx.get("cli_order")
     return rec
 
 
@@ -688,24 +800,97 @@ def save_raw(run_id, name, res, workspace=None, files=None):
     return str(d.relative_to(BENCH_DIR)).replace("\\", "/")
 
 
+def _children_cpu():
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return ru.ru_utime + ru.ru_stime
+    except Exception:  # Windows
+        return None
+
+
+def _load_avg():
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):  # Windows
+        return None
+
+
 def grade_workspace(task, workspace):
+    """숨은 테스트로 채점. 채점 조건(채점 직전 부하, 채점 wall/CPU 시간)도 같이 돌려준다.
+    vrptw_opt처럼 정해진 시간 안에 계산하는 과제는 맥의 CPU 상태가 점수에 직접 들어가기 때문이다."""
     cmd = [sys.executable, "-I", "-B", str(task["dir"] / "grade.py"), str(workspace)]
+    cond = {"load_avg_1m": _load_avg()}
+    w0, c0 = time.perf_counter(), _children_cpu()
+    report = error = None
     try:
         out = subprocess.run(cmd, cwd=str(workspace), capture_output=True, timeout=300)
         report = json.loads(out.stdout.decode("utf-8", "replace").strip().splitlines()[-1])
     except subprocess.TimeoutExpired:
-        return {"score": 0.0, "passed": 0, "total": None, "failed_cases": None,
-                "grade_error": "grader timeout (300s)"}
+        error = "timeout"
     except Exception as exc:
+        error = f"grader crashed: {exc}"[:300]
+    cond["grade_wall_sec"] = round(time.perf_counter() - w0, 2)
+    c1 = _children_cpu()
+    cond["grade_cpu_sec"] = None if c0 is None or c1 is None else round(c1 - c0, 2)
+    if error == "timeout":
+        return {"score": 0.0, "passed": 0, "total": None, "failed_cases": None,
+                "grade_error": "grader timeout (300s)", **cond}
+    if error:
         return {"score": None, "passed": None, "total": None, "failed_cases": None,
-                "grade_error": f"grader crashed: {exc}"[:300]}
+                "grade_error": error, **cond}
     total = report["total"] or 1
     return {"score": round(report["passed"] / total, 4), "passed": report["passed"],
             "total": report["total"], "failed_cases": [f["case"] for f in report["failed"]],
-            "grade_error": report.get("load_error")}
+            "grade_error": report.get("load_error"), **cond}
+
+
+# 핑 직전에 API 호스트까지의 통신 시간을 따로 잰다 (쿼터 0). CLI가 재는 시간과 섞지 않으려고 별도 연결을 쓴다.
+# 인증 정보는 보내지 않는다(HEAD / 한 번). 403·404 같은 응답도 시간만 보면 되므로 괜찮다.
+NET_PROBE_HOSTS = {"claude": "api.anthropic.com", "codex": "chatgpt.com"}
+
+
+def net_probe(host, timeout=10.0):
+    import socket
+    import ssl
+    out = {"net_host": host, "net_dns_ms": None, "net_tcp_ms": None, "net_tls_ms": None,
+           "net_ttfb_ms": None, "net_status": None, "net_error": None}
+    sock = None
+    try:
+        t0 = time.perf_counter()
+        family, socktype, proto, _, addr = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)[0]
+        t1 = time.perf_counter()
+        out["net_dns_ms"] = round((t1 - t0) * 1000, 1)
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        sock.connect(addr)
+        t2 = time.perf_counter()
+        out["net_tcp_ms"] = round((t2 - t1) * 1000, 1)
+        sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        t3 = time.perf_counter()
+        out["net_tls_ms"] = round((t3 - t2) * 1000, 1)
+        sock.sendall((f"HEAD / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: burgertime-netprobe\r\n"
+                      "Accept: */*\r\nConnection: close\r\n\r\n").encode("ascii"))
+        first = sock.recv(64)
+        out["net_ttfb_ms"] = round((time.perf_counter() - t3) * 1000, 1)
+        parts = first.split(b" ", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            out["net_status"] = int(parts[1])
+    except Exception as exc:  # 통신 측정이 실패해도 핑은 그대로 진행한다
+        out["net_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    finally:
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
+    return out
 
 
 def measure_ping(cfg, target, ctx, run_id):
+    net = None
+    if cfg.get("net_probe", True):
+        net = net_probe(target.get("net_probe_host") or NET_PROBE_HOSTS[target["cli"]])
     cwd = Path(tempfile.mkdtemp(prefix="bt_ping_"))
     started = time.time()
     try:
@@ -715,6 +900,10 @@ def measure_ping(cfg, target, ctx, run_id):
         shutil.rmtree(cwd, ignore_errors=True)
     rec = base_record("ping", run_id, target, started, ctx)
     rec.update(parsed)
+    add_phases(rec, started)
+    mark_version(cfg, rec)
+    if net:
+        rec.update(net)
     rec["wall_sec"] = res["wall_sec"]
     rec["exit_code"] = res["exit_code"]
     rec["timed_out"] = res["timed_out"]
@@ -760,6 +949,8 @@ def measure_task(cfg, target, task, ctx, run_id):
         grade = grade_workspace(task, ws)
         rec = base_record("quality", run_id, target, started, ctx, task)
         rec.update(parsed)
+        add_phases(rec, started)
+        mark_version(cfg, rec)
         rec.update(grade)
         # 파일을 하나도 안 건드렸다면 권한·샌드박스 문제일 가능성이 크다. 점수 저하로 오인하지 않게 표시한다.
         rec["files_changed"] = sum(before.get(k) != v for k, v in after.items()) + \
@@ -818,17 +1009,28 @@ def run_pings(cfg, targets, ctx):
 def run_quality(cfg, targets, tasks, ctx):
     run_id = dt.datetime.now(KST).strftime("%Y%m%dT%H%M") + "-q-" + uuid.uuid4().hex[:6]
     records = []
+    ctx = dict(ctx)
+    if ctx.get("slot_epoch_hour") is None:
+        ctx["slot_epoch_hour"] = int(time.time() // 3600)
 
-    def work(target):
+    def work(target, tctx):
         order = tasks[:]
         random.shuffle(order)  # 과제 순서 효과를 없앤다
         for task in order:
             try:
-                records.append(measure_task(cfg, target, task, ctx, run_id))
+                records.append(measure_task(cfg, target, task, tctx, run_id))
             except Exception as exc:
-                records.append(_error_record("quality", run_id, target, ctx, exc, task))
+                records.append(_error_record("quality", run_id, target, tctx, exc, task))
 
-    by_cli_in_parallel(targets, work)
+    if cfg.get("parallel_quality", True):
+        by_cli_in_parallel(targets, lambda t: work(t, ctx))
+    else:
+        # 한 CLI씩 차례로. 동시에 돌리면 서로 CPU를 나눠 써서 시간 제한 과제(vrptw_opt)의 점수가 흔들린다.
+        # 먼저 도는 쪽이 매번 같으면 시각이 한쪽으로 치우치므로 순서를 섞고 기록한다.
+        order = targets[:]
+        random.shuffle(order)
+        for i, target in enumerate(order, 1):
+            work(target, dict(ctx, cli_order=i))
     return records
 
 
@@ -909,7 +1111,8 @@ def cmd_quality(cfg, args):
                 state = load_state()
                 state["last_quality_epoch_hour"] = args.epoch_hour
                 save_state(state)
-        ctx = {"trigger": args.trigger, "gap_sec": args.gap_sec, "after_gap": args.after_gap}
+        ctx = {"trigger": args.trigger, "gap_sec": args.gap_sec, "after_gap": args.after_gap,
+               "slot_epoch_hour": args.epoch_hour}
         targets = select_targets(cfg, args.target, "quality")
         tasks = load_tasks(cfg, args.task)
         log(f"quality 시작: {[t['name'] for t in targets]} x {[t['id'] for t in tasks]}")
@@ -956,6 +1159,98 @@ def cmd_calibrate(cfg, args):
     print("\n점수가 계속 1.00이면 그 과제는 천장입니다. 그래도 thinking 토큰·소요 시간 변화는 볼 수 있지만,"
           "\n정답률 차이를 보려면 0.5~0.9 정도가 나오는 과제가 좋습니다.")
     return 0
+
+
+REGRADE_FILE = RESULTS_DIR / "regrade.jsonl"
+
+
+def _safe_extract(zip_path, dest):
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            target = os.path.realpath(os.path.join(dest, name))
+            if not target.startswith(os.path.realpath(dest) + os.sep):
+                raise ValueError(f"zip 안의 경로가 작업 폴더 밖을 가리킵니다: {name}")
+        zf.extractall(dest)
+
+
+def cmd_regrade(cfg, args):
+    """보관한 작업 폴더(results/raw/.../*.workspace.zip)를 지금의 숨은 테스트로 다시 채점한다. 모델 호출 없음.
+    실시간 채점은 과제 직후 같은 맥에서 바로 하므로, 그때의 CPU 상태가 점수에 섞일 수 있다(특히 vrptw_opt).
+    조용할 때 하나씩 여러 번 채점해 그 영향을 뺀다. 결과는 results/regrade.jsonl, analyze.py --regrade로 쓴다."""
+    RESULTS_DIR.mkdir(exist_ok=True)
+    lock = FileLock(QUALITY_LOCK, blocking=False)
+    if not lock.acquire(wait_sec=15):
+        print("과제 실행이 진행 중입니다. 끝난 뒤 다시 실행하세요 (채점이 CPU를 나눠 쓰지 않게).")
+        return 1
+    try:
+        done = set()
+        if REGRADE_FILE.exists() and not args.force:
+            for line in REGRADE_FILE.read_text(encoding="utf-8").splitlines():
+                row = _json(line) or {}
+                done.add((row.get("run_id"), row.get("target"), row.get("task"), row.get("repeat")))
+        recs = [_json(line) or {} for line in RUNS_FILE.read_text(encoding="utf-8").splitlines()]
+        recs = [r for r in recs if r.get("kind") == "quality" and r.get("raw_path") and r.get("task")
+                and (args.all_triggers or r.get("trigger") == "schedule")
+                and (not args.run_id or r.get("run_id") in args.run_id)
+                and (not args.task or r.get("task") in args.task)
+                and (not args.since or r.get("kst_date", "") >= args.since)]
+        tasks, skipped = {}, Counter()
+        for r in recs:
+            if (r["run_id"], r["target"], r["task"], args.repeat) in done:
+                skipped["이미 다시 채점함"] += 1
+                continue
+            zpath = BENCH_DIR / r["raw_path"] / f"{r['target']}__{r['task']}.workspace.zip"
+            if not zpath.exists():
+                skipped["작업 폴더 zip 없음"] += 1
+                continue
+            if r["task"] not in tasks:
+                try:
+                    tasks[r["task"]] = load_task(r["task"])
+                except OSError:
+                    tasks[r["task"]] = None
+            task = tasks[r["task"]]
+            if task is None:
+                skipped["과제 폴더 없음"] += 1
+                continue
+            if task["version"] != r.get("task_version"):
+                skipped["과제 버전이 달라짐"] += 1
+                continue
+            grades = []
+            for _ in range(args.repeat):
+                ws = Path(tempfile.mkdtemp(prefix=f"bt_regrade_{r['task']}_"))
+                try:
+                    _safe_extract(zpath, ws)
+                    grades.append(grade_workspace(task, ws))
+                finally:
+                    shutil.rmtree(ws, ignore_errors=True)
+            scores = [g["score"] for g in grades if isinstance(g.get("score"), (int, float))]
+            row = {"run_id": r["run_id"], "target": r["target"], "task": r["task"],
+                   "task_version": r.get("task_version"), "trigger": r.get("trigger"),
+                   "started_utc": r.get("started_utc"), "live_score": r.get("score"),
+                   "repeat": args.repeat, "scores": scores,
+                   "median": round(statistics_median(scores), 4) if scores else None,
+                   "grade_wall_sec": [g.get("grade_wall_sec") for g in grades],
+                   "grade_cpu_sec": [g.get("grade_cpu_sec") for g in grades],
+                   "load_avg_1m": [g.get("load_avg_1m") for g in grades],
+                   "grade_errors": [g.get("grade_error") for g in grades if g.get("grade_error")],
+                   "regraded_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                   "python": sys.version.split()[0]}
+            with FileLock(RESULTS_DIR / "runs.lock"):
+                with open(REGRADE_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            print(f"{r['run_id']} {r['target']:<14} {r['task']:<14} 실시간 {r.get('score')}  "
+                  f"다시 채점 {scores} -> 중앙값 {row['median']}")
+        if skipped:
+            print("건너뜀:", dict(skipped))
+    finally:
+        lock.release()
+    return 0
+
+
+def statistics_median(xs):
+    s = sorted(xs)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def spawn_quality(ctx, epoch_hour):
@@ -1049,13 +1344,21 @@ def main(argv=None):
     c.add_argument("--target", action="append")
     c.add_argument("--task", action="append")
     c.add_argument("--repeat", type=int, default=2)
+    g = sub.add_parser("regrade", help="보관한 작업 폴더를 다시 채점 (쿼터 0, results/regrade.jsonl)")
+    g.add_argument("--repeat", type=int, default=3, help="과제 기록 하나당 채점 횟수 (기본 3)")
+    g.add_argument("--run-id", action="append", help="이 run_id만 (여러 번 지정 가능)")
+    g.add_argument("--task", action="append", help="이 과제만")
+    g.add_argument("--since", help="이 날짜(KST, YYYY-MM-DD) 이후 기록만")
+    g.add_argument("--all-triggers", action="store_true", help="calibrate·수동 실행도 포함")
+    g.add_argument("--force", action="store_true", help="이미 다시 채점한 것도 다시")
     sub.add_parser("tick", help="launchd 진입점")
     s = sub.add_parser("status", help="최근 기록 보기")
     s.add_argument("-n", type=int, default=12)
     args = parser.parse_args(argv)
     cfg = load_config()
     handler = {"selftest": cmd_selftest, "ping": cmd_ping, "quality": cmd_quality,
-               "calibrate": cmd_calibrate, "tick": cmd_tick, "status": cmd_status}[args.command]
+               "calibrate": cmd_calibrate, "regrade": cmd_regrade, "tick": cmd_tick,
+               "status": cmd_status}[args.command]
     return handler(cfg, args)
 
 

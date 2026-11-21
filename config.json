@@ -4,10 +4,14 @@
   "quality_every_hours": 6,
   "task_timeout_sec": 900,
   "tasks": ["cron_next", "sheet_engine", "patch_apply"],
+  "parallel_quality": false,
+  "net_probe": true,
+  "disable_cli_autoupdate": true,
+  "expected_cli_versions": {"claude": null, "codex": null},
   "keep_raw": true,
   "env_file": ".env",
   "codex_ignore_user_config": true,
-  "codex_config_overrides": [],
+  "codex_config_overrides": ["features.remote_plugin=false", "features.apps=false", "features.plugins=false"],
   "targets": [
     {
       "name": "claude-opus",

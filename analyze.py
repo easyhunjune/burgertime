@@ -6,11 +6,17 @@
   python3 analyze.py --since 2026-10-20   # 특정 날짜 이후만 (CLI 업데이트 이후만 보고 싶을 때)
   python3 analyze.py --since "2026-10-13 09:00" --until "2026-11-10 09:00"   # 시각(KST) 단위 구간
   python3 analyze.py --csv out.csv        # 걸러진 기록을 CSV로 내보내기
+  python3 analyze.py --since ... --until ... --verdict round1   # 사전 등록 규칙으로 판정표까지 출력
+  python3 analyze.py --score-timeouts      # 과제 제한시간에 걸린 실행도 그 시점 산출물 점수로 포함 (2차용)
+  python3 analyze.py --regrade results/regrade.jsonl   # 나중에 다시 채점한 점수(중앙값)로 바꿔서 분석
 
 신뢰구간은 클러스터 부트스트랩으로 구한다. 한 번의 과제 실행(run_id)에서 나온 기록들, 같은 날의 ping들은
 서로 묶여 움직이므로 기록 하나하나를 독립 표본으로 치면 구간이 실제보다 좁아진다.
 그래서 quality는 실행 단위, ping은 날짜 단위로 통째로 다시 뽑는다. 최소 표본 수(--min-n)도 이 묶음 수 기준이다.
 구간이 0(차이) 또는 1.00x(비율)을 포함하지 않으면 '유의'로 표시한다.
+
+옵션을 주지 않으면 1차 공개 때와 똑같은 출력이 나온다(data/round1/analysis_*.txt). 새 기능은 모두 옵션으로 켜고,
+--verdict의 추가 계산은 기존 출력이 끝난 뒤 별도 난수로 하므로 기존 신뢰구간 숫자를 바꾸지 않는다.
 """
 from __future__ import annotations
 
@@ -35,6 +41,26 @@ BROKEN_WINDOWS = [
 ]
 CODEX_THINKING_NOTE = ("Codex의 thinking 토큰(reasoning_output_tokens)은 실제 추론량보다 훨씬 작게 찍힙니다"
                        " (예: high effort 95초 과제에 146). 참고용으로만 보세요.")
+
+# --score-timeouts: 과제의 제한시간 도달(timeout)을 "그 시점까지의 산출물"로 보고 점수·시간·thinking에 포함한다.
+# 1차 규칙(기본값)은 성공(ok)만 쓴다. 2차는 제한시간에 걸리는 과제가 많아서 빼면 느린 실행만 골라 빠진다.
+SCORE_TIMEOUTS = False
+# --verdict 계산에서 쓰려고 기존 비교 줄의 결과를 모아 둔다. 출력과 난수 사용 순서는 그대로다.
+RESULTS = {}
+
+# 사전 등록한 판정 지표: (CLI, 종류, analyze 출력 줄 이름, 값, 비교 방식, 의미 있는 최소 크기 (아래, 위))
+# 비교 방식 ratio는 버거타임 중앙값 / 나머지 중앙값, diff는 평균 차이(비율 단위, 0.02 = 2%p).
+VERDICT_SETS = {
+    "round1": [
+        ("claude", "ping", "첫 응답 시간 (중앙값 비)", "t_first_output_sec", "ratio", (0.91, 1.10)),
+        ("codex", "ping", "첫 응답 시간 (중앙값 비)", "t_first_output_sec", "ratio", (0.91, 1.10)),
+        ("claude", "ping", "서버 오류율 차이", "_server_error", "diff", (-0.02, 0.02)),
+        ("codex", "ping", "서버 오류율 차이", "_server_error", "diff", (-0.02, 0.02)),
+        ("claude", "quality", "소요 시간 (중앙값 비)", "wall_sec", "ratio", (0.91, 1.10)),
+        ("codex", "quality", "소요 시간 (중앙값 비)", "wall_sec", "ratio", (0.91, 1.10)),
+        ("claude", "quality", "thinking 토큰 (중앙값 비)", "_thinking", "ratio", (0.85, 1.18)),
+    ],
+}
 
 
 def parse_hours(spec):
@@ -70,6 +96,31 @@ def load(path):
 def util_of(r):
     vals = [v for v in (r.get("rl_5h_util"), r.get("rl_7d_util")) if isinstance(v, (int, float))]
     return max(vals) if vals else None
+
+
+def hour_of(r):
+    """버거타임 여부를 정하는 한국 시각. 과제는 예정 시각(slot_kst_hour)으로 본다.
+    2차부터 두 CLI를 차례로 돌려서 두 번째 대상은 03시 실행이 04시에 시작할 수 있기 때문이다.
+    slot 필드가 없는 1차 기록은 실제 시작 시각이다."""
+    h = r.get("slot_kst_hour")
+    return h if isinstance(h, int) else r["kst_hour"]
+
+
+def usable(r):
+    """값(시간·토큰·점수)을 쓰는 기록인가. 기본은 성공(ok)만.
+    --score-timeouts면 과제의 제한시간 도달도 쓴다 (채점은 그 시점 작업 폴더로 이미 되어 있다)."""
+    if r.get("status") == "ok":
+        return True
+    return (SCORE_TIMEOUTS and r.get("kind") == "quality" and r.get("status") == "timeout"
+            and isinstance(r.get("score"), (int, float)))
+
+
+def thinking_value(r):
+    """thinking 토큰. --score-timeouts에서는 실행 중 스트림으로 센 추정치(thinking_tokens_est)를 쓴다.
+    제한시간에 걸린 실행은 최종 사용량 보고가 없어 thinking_tokens가 비기 때문이다(2차부터 기록)."""
+    if SCORE_TIMEOUTS and isinstance(r.get("thinking_tokens_est"), (int, float)):
+        return r["thinking_tokens_est"]
+    return r.get("thinking_tokens")
 
 
 def kst_stamp(r):
@@ -149,7 +200,7 @@ def clusters(recs, key, only_ok=True):
     """{묶음: [값, ...]}. key가 함수면 r -> 값(None이면 건너뜀)."""
     out = defaultdict(list)
     for r in recs:
-        if only_ok and r.get("status") != "ok":
+        if only_ok and not usable(r):
             continue
         v = key(r) if callable(key) else r.get(key)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
@@ -202,11 +253,14 @@ def pad(text, width):
     return text + " " * max(0, width - shown)
 
 
-def compare_line(label, ca, cb, kind, rng, args, scale=1.0, unit=""):
-    """ca=버거타임 묶음들, cb=나머지 묶음들. kind='diff'(평균 차이) 또는 'ratio'(중앙값 비율)."""
+def compare_line(label, ca, cb, kind, rng, args, scale=1.0, unit="", store=None):
+    """ca=버거타임 묶음들, cb=나머지 묶음들. kind='diff'(평균 차이) 또는 'ratio'(중앙값 비율).
+    store를 주면 (점추정, 구간, 묶음 수)를 RESULTS[store]에 남긴다 (--verdict용, 출력에는 영향 없음)."""
     na, nb = len(ca), len(cb)
     ra, rb = sum(map(len, ca)), sum(map(len, cb))
     sizes = f"(기록 {ra}/{rb}, 묶음 {na}/{nb})"
+    if store is not None:
+        RESULTS[store] = {"point": None, "lo": None, "hi": None, "na": na, "nb": nb, "ra": ra, "rb": rb}
     if na < max(1, args.min_n) or nb < max(1, args.min_n):
         return f"  {pad(label, 28)} 표본 부족 {sizes}, 묶음 최소 {args.min_n}"
     if kind == "diff":
@@ -219,6 +273,8 @@ def compare_line(label, ca, cb, kind, rng, args, scale=1.0, unit=""):
         fmt_ = lambda v: f"{v:.3f}x"  # noqa: E731
         if point is None:
             return f"  {pad(label, 28)} 중앙값이 0이라 비율 비교 불가 {sizes}"
+    if store is not None:
+        RESULTS[store].update(point=point, lo=lo, hi=hi)
     if lo is None:
         return f"  {pad(label, 28)} {fmt_(point)}  (신뢰구간 계산 불가) {sizes}"
     sig = "  <- 유의" if (lo > null or hi < null) else ""
@@ -239,6 +295,8 @@ def server_error_flag(r):
     """서버 쪽 실패면 1, 성공이면 0. 한도 초과·측정기 오류는 None(분모에서 제외)."""
     if r.get("status") == "ok":
         return 0.0
+    if usable(r):  # --score-timeouts: 과제 제한시간 도달은 작업 시간 예산이 끝난 것이지 서버 오류가 아니다
+        return 0.0
     if r.get("status") in SERVER_ERRORS:
         return 1.0
     return None
@@ -247,7 +305,7 @@ def server_error_flag(r):
 def hourly_table(recs, kind, burger):
     by_hour = defaultdict(list)
     for r in recs:
-        by_hour[r["kst_hour"]].append(r)
+        by_hour[hour_of(r)].append(r)
     if kind == "ping":
         print("   시    n  서버오류  한도   첫응답p50   p90  TTFT ms p50  전체p50")
     else:
@@ -267,7 +325,7 @@ def hourly_table(recs, kind, burger):
                   f"{fmt(median(values(rs, 'wall_sec')), 2):>7}")
         else:
             print(f"  {mark}{h:02d}  {len(rs):4d}    {err}  {limited:4d}   {fmt(mean(values(rs, 'score')), 3):>7}  "
-                  f"{fmt(median(values(rs, 'thinking_tokens')), 0):>12}  "
+                  f"{fmt(median(values(rs, thinking_value)), 0):>12}  "
                   f"{fmt(median(values(rs, 'tool_calls')), 0):>12}  "
                   f"{fmt(median(values(rs, 'wall_sec')), 0):>12}")
 
@@ -276,22 +334,31 @@ def centered_scores(recs):
     """과제마다 난이도가 다르므로 과제 평균을 빼서 비교한다."""
     by_task = defaultdict(list)
     for r in recs:
-        if r.get("status") == "ok" and isinstance(r.get("score"), (int, float)):
+        if usable(r) and isinstance(r.get("score"), (int, float)):
             by_task[r.get("task")].append(r["score"])
     task_mean = {t: mean(v) for t, v in by_task.items()}
     for r in recs:
-        if r.get("status") == "ok" and isinstance(r.get("score"), (int, float)):
+        if usable(r) and isinstance(r.get("score"), (int, float)):
             r["_centered"] = r["score"] - task_mean[r.get("task")]
         else:
             r["_centered"] = None
 
 
-def comparison(recs, kind, burger, rng, args, title):
-    a = [r for r in recs if r["kst_hour"] in burger]
-    b = [r for r in recs if r["kst_hour"] not in burger]
+def has_field(recs, key):
+    return any(isinstance(r.get(key), (int, float)) for r in recs)
+
+
+def comparison(recs, kind, burger, rng, args, title, tag=None):
+    """tag=(대상 이름, 부분집합 이름)을 주면 각 줄의 결과를 RESULTS에 남긴다 (출력은 같다)."""
+    def key(label):
+        return None if tag is None else tag + (kind, label)
+
+    a = [r for r in recs if hour_of(r) in burger]
+    b = [r for r in recs if hour_of(r) not in burger]
     print(f"  -- {title}: 버거타임 {len(a)}건 vs 나머지 {len(b)}건")
     print(compare_line("서버 오류율 차이", clusters(a, server_error_flag, False),
-                       clusters(b, server_error_flag, False), "diff", rng, args, 100, "%p"))
+                       clusters(b, server_error_flag, False), "diff", rng, args, 100, "%p",
+                       store=key("서버 오류율 차이")))
     la = sum(r.get("status") == "rate_limited" for r in a)
     lb = sum(r.get("status") == "rate_limited" for r in b)
     if la or lb:
@@ -299,23 +366,37 @@ def comparison(recs, kind, burger, rng, args, title):
               " (내 사용 패턴 영향이라 판단에서 제외)")
     if kind == "ping":
         print(compare_line("첫 응답 시간 (중앙값 비)", clusters(a, "t_first_output_sec"),
-                           clusters(b, "t_first_output_sec"), "ratio", rng, args))
+                           clusters(b, "t_first_output_sec"), "ratio", rng, args,
+                           store=key("첫 응답 시간 (중앙값 비)")))
         ttft_a, ttft_b = clusters(a, "ttft_ms"), clusters(b, "ttft_ms")
         if ttft_a or ttft_b:
-            print(compare_line("API TTFT (중앙값 비)", ttft_a, ttft_b, "ratio", rng, args))
+            print(compare_line("API TTFT (중앙값 비)", ttft_a, ttft_b, "ratio", rng, args,
+                               store=key("API TTFT (중앙값 비)")))
         print(compare_line("전체 소요 (중앙값 비)", clusters(a, "wall_sec"), clusters(b, "wall_sec"),
                            "ratio", rng, args))
+        # 2차부터 기록하는 단계별 시간. 1차 기록에는 없어서 이 줄들은 나오지 않는다.
+        for field, label in (("t_model_sec", "모델 응답 시간 (중앙값 비)"),
+                             ("t_prep_sec", "CLI 준비 시간 (중앙값 비)"),
+                             ("net_ttfb_ms", "통신 시간 (중앙값 비)")):
+            if has_field(recs, field):
+                print(compare_line(label, clusters(a, field), clusters(b, field), "ratio", rng, args,
+                                   store=key(label)))
     else:
+        if SCORE_TIMEOUTS:
+            timed = lambda r: 1.0 if r.get("status") == "timeout" else 0.0  # noqa: E731
+            print(compare_line("제한시간 도달 비율 차이", clusters(a, timed), clusters(b, timed),
+                               "diff", rng, args, 100, "%p", store=key("제한시간 도달 비율 차이")))
         print(compare_line("점수 차이 (과제 보정)", clusters(a, "_centered"), clusters(b, "_centered"),
-                           "diff", rng, args, 100, "%p"))
-        print(compare_line("thinking 토큰 (중앙값 비)", clusters(a, "thinking_tokens"),
-                           clusters(b, "thinking_tokens"), "ratio", rng, args))
+                           "diff", rng, args, 100, "%p", store=key("점수 차이 (과제 보정)")))
+        print(compare_line("thinking 토큰 (중앙값 비)", clusters(a, thinking_value),
+                           clusters(b, thinking_value), "ratio", rng, args,
+                           store=key("thinking 토큰 (중앙값 비)")))
         print(compare_line("도구 호출 수 (중앙값 비)", clusters(a, "tool_calls"),
                            clusters(b, "tool_calls"), "ratio", rng, args))
         print(compare_line("출력 토큰 (중앙값 비)", clusters(a, "output_tokens"),
                            clusters(b, "output_tokens"), "ratio", rng, args))
         print(compare_line("소요 시간 (중앙값 비)", clusters(a, "wall_sec"), clusters(b, "wall_sec"),
-                           "ratio", rng, args))
+                           "ratio", rng, args, store=key("소요 시간 (중앙값 비)")))
 
 
 def target_report(name, recs, args, burger, rng):
@@ -355,6 +436,12 @@ def target_report(name, recs, args, burger, rng):
               " - 권한·샌드박스 문제인지 raw 로그 확인 필요")
     if cli == "codex" and any(r.get("kind") == "quality" for r in recs):
         print("참고: " + CODEX_THINKING_NOTE)
+    hashes = Counter(r.get("prompt_hash") for r in recs if r.get("kind") == "ping" and r.get("prompt_hash"))
+    if hashes:  # 2차부터 기록. 요청 구성(시스템 지시·스킬 목록)이 기간 중에 바뀌었는지 보여 준다.
+        print(f"ping 요청 구성(prompt_hash) {len(hashes)}종: {dict(hashes.most_common(5))}")
+    drift = sum(1 for r in recs if r.get("version_drift"))
+    if drift:
+        print(f"고정한 CLI 버전과 다른 버전으로 돈 기록: {drift}건 (version_drift)")
 
     for kind in ("ping", "quality"):
         rs = [r for r in recs if r.get("kind") == kind]
@@ -367,17 +454,213 @@ def target_report(name, recs, args, burger, rng):
         print(f"\n[{label}]  한국시간별  (* = 버거타임, 신뢰구간 묶음 단위 = {unit})")
         hourly_table(rs, kind, burger)
         print()
-        comparison(rs, kind, burger, rng, args, "전체 요일")
+        comparison(rs, kind, burger, rng, args, "전체 요일", tag=(name, "all"))
         weekday = [r for r in rs if r.get("us_pacific_weekday") is not None and r["us_pacific_weekday"] < 5]
-        comparison(weekday, kind, burger, rng, args, "미국 평일만 (태평양시 월~금)")
+        comparison(weekday, kind, burger, rng, args, "미국 평일만 (태평양시 월~금)", tag=(name, "weekday"))
         if kind == "quality":
             print("\n  과제별 점수 평균 (버거타임 / 나머지)")
             by_task = defaultdict(lambda: ([], []))
             for r in rs:
-                if r.get("status") == "ok" and isinstance(r.get("score"), (int, float)):
-                    by_task[r.get("task")][0 if r["kst_hour"] in burger else 1].append(r["score"])
+                if usable(r) and isinstance(r.get("score"), (int, float)):
+                    by_task[r.get("task")][0 if hour_of(r) in burger else 1].append(r["score"])
             for task, (sa, sb) in sorted(by_task.items()):
                 print(f"    {task:<16} {fmt(mean(sa), 3)} (n={len(sa)}) / {fmt(mean(sb), 3)} (n={len(sb)})")
+
+
+# ---------------------------------------------------------------- verdict (--verdict)
+
+def _metric_fn(key):
+    """판정 지표 값 -> (clusters()에 줄 key, 성공 기록만 쓰는지)."""
+    if key == "_server_error":
+        return server_error_flag, False
+    if key == "_thinking":
+        return thinking_value, True
+    return key, True
+
+
+def _split_clusters(recs, burger, key):
+    fn, only_ok = _metric_fn(key)
+    a = [r for r in recs if hour_of(r) in burger]
+    b = [r for r in recs if hour_of(r) not in burger]
+    return clusters(a, fn, only_ok), clusters(b, fn, only_ok)
+
+
+def _point(ca, cb, how):
+    fa = [v for c in ca for v in c]
+    fb = [v for c in cb for v in c]
+    if not fa or not fb:
+        return None
+    if how == "ratio":
+        ma, mb = median(fa), median(fb)
+        return ma / mb if ma and mb else None
+    return mean(fa) - mean(fb)
+
+
+def _boot_p(ca, cb, how, rng, n_boot):
+    """양쪽 묶음을 따로 다시 뽑는 기존 방식으로 양측 부트스트랩 p값 근사. 등록 규칙에는 없는 참고값."""
+    null = 1.0 if how == "ratio" else 0.0
+    draws = []
+    for _ in range(n_boot):
+        x = _point(rng.choices(ca, k=len(ca)), rng.choices(cb, k=len(cb)), how)
+        if x is not None:
+            draws.append(x)
+    if not draws:
+        return None
+    below = sum(d <= null for d in draws) / len(draws)
+    above = sum(d >= null for d in draws) / len(draws)
+    return max(1.0 / len(draws), min(1.0, 2 * min(below, above)))
+
+
+def _interaction(recs, burger, key, how, rng, n_boot):
+    """미국 평일의 버거타임 효과 ÷ 주말의 버거타임 효과 (diff는 평일 차이 − 주말 차이).
+    날짜를 통째로 다시 뽑아 네 칸(평일·주말 × 버거·나머지)이 같은 날짜 표본에서 나오게 한다."""
+    fn, only_ok = _metric_fn(key)
+    days = defaultdict(lambda: ([], [], [], []))
+    for r in recs:
+        if only_ok and not usable(r):
+            continue
+        v = fn(r) if callable(fn) else r.get(fn)
+        wd = r.get("us_pacific_weekday")
+        if wd is None or not isinstance(v, (int, float)) or isinstance(v, bool):
+            continue
+        days[r["kst_date"]][(0 if wd < 5 else 2) + (0 if hour_of(r) in burger else 1)].append(float(v))
+    keys = list(days)
+    n_days = [sum(1 for d in keys if days[d][i]) for i in range(4)]
+
+    def stat(sample):
+        cells = [[v for d in sample for v in days[d][i]] for i in range(4)]
+        if any(not c for c in cells):
+            return None
+        if how == "ratio":
+            m = [median(c) for c in cells]
+            return (m[0] / m[1]) / (m[2] / m[3]) if all(m) else None
+        return (mean(cells[0]) - mean(cells[1])) - (mean(cells[2]) - mean(cells[3]))
+
+    point = stat(keys) if keys else None
+    if point is None or min(n_days) < 3:
+        return point, None, None, n_days
+    draws = [x for x in (stat([rng.choice(keys) for _ in keys]) for _ in range(n_boot)) if x is not None]
+    lo, hi = _percentile_ci(draws)
+    return point, lo, hi, n_days
+
+
+def _holm(pvals):
+    order = sorted(range(len(pvals)), key=lambda i: pvals[i])
+    adj, running = [None] * len(pvals), 0.0
+    for rank, i in enumerate(order):
+        running = max(running, min(1.0, (len(pvals) - rank) * pvals[i]))
+        adj[i] = running
+    return adj
+
+
+def verdict(by_target, args, burger):
+    """사전 등록 규칙 1~4로 판정표를 만든다. 전체 구간의 점추정·신뢰구간과 미국 평일 점추정은 위 비교 줄의 값을
+    그대로 쓰고(RESULTS), 전반·후반은 구간을 반으로 나눠 점추정만 다시 계산한다(난수 없음).
+    평일÷주말 상호작용, p값, Holm 보정은 등록 규칙 밖의 참고값이며 별도 난수(seed+1)로 계산한다."""
+    if not (args.since and args.until):
+        print("\n--verdict에는 --since와 --until이 필요합니다 (판정 구간과 전반·후반 경계를 정하려고).")
+        return
+    t0 = dt.datetime.strptime(norm_stamp(args.since), "%Y-%m-%d %H:%M")
+    t1 = dt.datetime.strptime(norm_stamp(args.until), "%Y-%m-%d %H:%M")
+    mid = (t0 + (t1 - t0) / 2).strftime("%Y-%m-%d %H:%M")
+    rng = random.Random(args.seed + 1)
+    rows = []
+    for cli, kind, label, key, how, (blo, bhi) in VERDICT_SETS[args.verdict]:
+        for name in sorted(n for n, rs in by_target.items() if rs and rs[0].get("cli") == cli):
+            rs = [r for r in by_target[name] if r.get("kind") == kind]
+            res = RESULTS.get((name, "all", kind, label)) or {}
+            point, lo, hi = res.get("point"), res.get("lo"), res.get("hi")
+            wd = (RESULTS.get((name, "weekday", kind, label)) or {}).get("point")
+            halves = []
+            for part in ([r for r in rs if kst_stamp(r) < mid], [r for r in rs if kst_stamp(r) >= mid]):
+                ca, cb = _split_clusters(part, burger, key)
+                enough = len(ca) >= max(1, args.min_n) and len(cb) >= max(1, args.min_n)
+                halves.append(_point(ca, cb, how) if enough else None)
+            null = 1.0 if how == "ratio" else 0.0
+
+            def same(x):
+                return x is not None and point is not None and (x - null) * (point - null) > 0
+
+            r1 = lo is not None and hi is not None and (lo > null or hi < null)
+            r2 = point is not None and (point >= bhi or point <= blo)
+            r3, r4 = same(wd), same(halves[0]) and same(halves[1])
+            if r1 and r2 and r3 and r4:
+                v = "효과 있음 (버거타임 쪽이 " + ("작음" if point < null else "큼") + ")"
+            elif r1 and r2:
+                v = "약한 신호"
+            elif lo is not None and hi is not None and blo <= lo and hi <= bhi:
+                v = "차이 없음"
+            else:
+                v = "판단 불가" + (" (표본 부족)" if point is None else "")
+            ca, cb = _split_clusters(rs, burger, key)
+            events = None
+            if key == "_server_error":
+                events = int(sum(v_ for c in ca + cb for v_ in c))
+            p = _boot_p(ca, cb, how, rng, args.n_boot) if ca and cb else None
+            inter = _interaction(rs, burger, key, how, rng, args.n_boot)
+            rows.append({"name": name, "label": label, "how": how, "point": point, "lo": lo, "hi": hi,
+                         "wd": wd, "h1": halves[0], "h2": halves[1], "rules": (r1, r2, r3, r4),
+                         "verdict": v, "p": p, "inter": inter, "events": events, "bounds": (blo, bhi)})
+
+    ps = [r["p"] for r in rows if r["p"] is not None]
+    adj = iter(_holm(ps)) if ps else iter(())
+    for r in rows:
+        r["p_holm"] = next(adj) if r["p"] is not None else None
+
+    def f(x, how):
+        if x is None:
+            return "-"
+        return f"{x:.3f}x" if how == "ratio" else f"{x * 100:+.2f}%p"
+
+    print(f"\n{'=' * 78}\n판정 (사전 등록 규칙, 지표 세트 {args.verdict})\n{'=' * 78}")
+    print(f"구간 {norm_stamp(args.since)} ~ {norm_stamp(args.until)}, 전반·후반 경계 {mid}")
+    for r in rows:
+        ok = " ".join(f"{i + 1}{'O' if x else 'X'}" for i, x in enumerate(r["rules"]))
+        blo, bhi = r["bounds"]
+        print(f"\n  {r['name']} / {r['label']}   최소 크기 {f(blo, r['how'])} ~ {f(bhi, r['how'])}")
+        print(f"    전체 {f(r['point'], r['how'])} [{f(r['lo'], r['how'])} ~ {f(r['hi'], r['how'])}]"
+              f"  미국평일 {f(r['wd'], r['how'])}  전반 {f(r['h1'], r['how'])}  후반 {f(r['h2'], r['how'])}")
+        note = f"  (서버 오류 {r['events']}건)" if r["events"] is not None else ""
+        print(f"    규칙 {ok}  ->  {r['verdict']}{note}")
+        ip, ilo, ihi, nd = r["inter"]
+        unit = "÷" if r["how"] == "ratio" else "−"
+        pval = "-" if r["p"] is None else f"{r['p']:.3f}"
+        holm = "-" if r["p_holm"] is None else f"{r['p_holm']:.3f}"
+        print(f"    참고: 평일효과{unit}주말효과 {f(ip, r['how'])} [{f(ilo, r['how'])} ~ {f(ihi, r['how'])}]"
+              f" (날짜 수 평일버거/평일나머지/주말버거/주말나머지 {'/'.join(map(str, nd))})"
+              f"  p {pval}  Holm p {holm}")
+    print("\n판정 이름: 효과 있음 = 규칙 1~4 모두 충족 / 약한 신호 = 1·2만 충족 /"
+          "\n  차이 없음 = 1·2를 충족하지 못했고 신뢰구간 전체가 최소 크기 범위 안 /"
+          "\n  판단 불가 = 1·2를 충족하지 못했고 신뢰구간이 최소 크기 밖까지 걸침 (있을 수도 없을 수도 있음)")
+    print("규칙: 1 전체 신뢰구간이 기준선(1.00x 또는 0%p)을 포함하지 않음, 2 점추정이 최소 크기 이상,"
+          "\n  3 미국 평일 점추정이 같은 방향, 4 전반·후반 점추정이 모두 같은 방향(표본 부족이면 불충족)")
+    print("참고 값(등록 규칙 밖): 평일효과÷주말효과 = (미국 평일의 버거÷나머지) ÷ (주말의 버거÷나머지)."
+          "\n  1보다 작으면(차이는 0보다 작으면) 미국 평일에 버거타임 쪽이 상대적으로 더 작다(빠르다·적다)."
+          "\n  '미국 업무시간 부하 때문'이라면 평일에 버거타임 쪽이 더 커야(1보다 커야) 한다."
+          "\n  p와 Holm p는 기존 방식 부트스트랩 근사이고, Holm은 이 표의 지표 전체에 대한 보정이다.")
+    print("서버 오류율은 CLI가 내부에서 재시도하고도 끝내 실패한 실행만 셉니다. 재시도로 복구된 장애는 지연으로만 남습니다.")
+
+
+def apply_regrade(recs, path):
+    """run_bench.py regrade 결과(다시 채점한 점수들)의 중앙값으로 과제 점수를 바꾼다."""
+    table = {}
+    for row in load(path):
+        if isinstance(row.get("median"), (int, float)):
+            table[(row.get("run_id"), row.get("target"), row.get("task"))] = row
+    replaced = missing = mismatched = 0
+    for r in recs:
+        if r.get("kind") != "quality" or not isinstance(r.get("score"), (int, float)):
+            continue
+        row = table.get((r.get("run_id"), r.get("target"), r.get("task")))
+        if row is None:
+            missing += 1
+        elif row.get("task_version") != r.get("task_version"):
+            mismatched += 1
+        else:
+            r["score_live"], r["score"] = r["score"], row["median"]
+            replaced += 1
+    print(f"다시 채점한 점수로 바꾼 과제 기록 {replaced}건 / 다시 채점 기록 없음 {missing}건"
+          f" / 과제 버전이 달라 안 바꿈 {mismatched}건 (없거나 다른 건 실시간 채점 점수 그대로)")
 
 
 CSV_COLUMNS = [
@@ -388,6 +671,11 @@ CSV_COLUMNS = [
     "output_tokens", "thinking_tokens", "input_tokens", "cached_input_tokens", "rl_5h_util",
     "rl_7d_util", "inference_geo", "service_tier", "after_gap", "quality_running",
     "workspace_changed", "permission_denials", "error",
+    # 2차부터
+    "started_ts", "slot_kst_hour", "cli_order", "t_boot_sec", "t_prep_sec", "t_model_sec",
+    "net_host", "net_dns_ms", "net_tcp_ms", "net_tls_ms", "net_ttfb_ms", "net_status", "net_error",
+    "prompt_hash", "remote_plugins", "version_drift", "thinking_tokens_est", "grade_wall_sec", "load_avg_1m",
+    "score_live",
 ]
 
 
@@ -410,7 +698,14 @@ def main():
     ap.add_argument("--n-boot", type=int, default=1000, help="부트스트랩 반복 횟수")
     ap.add_argument("--csv", help="걸러진 기록을 CSV로 저장")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--verdict", choices=sorted(VERDICT_SETS),
+                    help="사전 등록 규칙으로 판정표 출력 (--since/--until 필요, 기존 출력 뒤에 붙음)")
+    ap.add_argument("--score-timeouts", action="store_true",
+                    help="과제 제한시간에 걸린 실행도 그 시점 점수·시간·thinking 추정치로 포함 (기본: 성공만)")
+    ap.add_argument("--regrade", help="run_bench.py regrade 결과 파일. 과제 점수를 다시 채점한 중앙값으로 바꿈")
     args = ap.parse_args()
+    global SCORE_TIMEOUTS
+    SCORE_TIMEOUTS = args.score_timeouts
 
     path = Path(args.file)
     if not path.exists():
@@ -420,6 +715,10 @@ def main():
     recs, dropped = filter_records(load(path), args)
     print(f"기록 {len(recs)}건 사용" + (f" / 제외: {dict(dropped)}" if dropped else ""))
     print(f"버거타임 = 한국시간 {sorted(burger)}시")
+    if args.score_timeouts:
+        print("과제: 제한시간에 걸린 실행도 그 시점 산출물 점수로 포함 (--score-timeouts)")
+    if args.regrade:
+        apply_regrade(recs, args.regrade)
     rng = random.Random(args.seed)
 
     by_target = defaultdict(list)
@@ -427,6 +726,8 @@ def main():
         by_target[r.get("target")].append(r)
     for name in sorted(by_target):
         target_report(name, by_target[name], args, burger, rng)
+    if args.verdict:
+        verdict(by_target, args, burger)
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as fh:
